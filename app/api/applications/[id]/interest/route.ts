@@ -1,18 +1,15 @@
 import { NextResponse } from 'next/server';
-import { getSupabaseAdmin } from '@/lib/supabaseAdmin';
+import { apiErrorResponse } from '@/lib/api';
+import { requireAuth } from '@/lib/auth';
+import { transitionApplicationForUser } from '@/lib/applicationService';
 
-export async function POST(_request: Request, context: { params: Promise<{ id: string }> }) {
+export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
   try {
+    const auth = await requireAuth(request);
     const { id } = await context.params;
-    const db = getSupabaseAdmin();
-    const { data, error } = await db.from('applications').update({
-      status: 'employer_interested',
-      employer_interest_at: new Date().toISOString(),
-    }).eq('id', id).eq('status', 'submitted').select('*').single();
-
-    if (error) throw error;
-    return NextResponse.json({ application: data });
-  } catch (error: any) {
-    return NextResponse.json({ error: error.message ?? 'Could not mark interest' }, { status: 400 });
+    const application = await transitionApplicationForUser({ applicationId: id, to: 'employer_interested', auth });
+    return NextResponse.json({ application });
+  } catch (error) {
+    return apiErrorResponse(error);
   }
 }

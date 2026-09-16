@@ -4,6 +4,9 @@ export function workerFromRows(worker: any, certifications: any[], availability:
   return {
     id: worker.id,
     preferredRoles: worker.preferred_roles ?? [],
+    preferredEmploymentTypes: worker.preferred_employment_types ?? [],
+    preferredWorkplaceTypes: worker.preferred_workplace_types ?? [],
+    roleKeywords: worker.role_keywords ?? [],
     minHourlyRate: Number(worker.min_hourly_rate),
     maxTravelKm: Number(worker.max_travel_km),
     minWeeklyHours: worker.min_weekly_hours,
@@ -17,14 +20,17 @@ export function workerFromRows(worker: any, certifications: any[], availability:
       startTime: row.start_time,
       endTime: row.end_time,
     })),
+    active: worker.active,
   };
 }
 
 export function jobFromRows(job: any, requiredCertifications: any[], shifts: any[]): JobForMatching {
   return {
     id: job.id,
+    title: job.title,
     category: job.category,
     hourlyRate: Number(job.hourly_rate),
+    maxHourlyRate: job.max_hourly_rate == null ? null : Number(job.max_hourly_rate),
     weeklyHours: job.weekly_hours,
     minExperienceMonths: job.min_experience_months,
     latitude: job.latitude,
@@ -36,5 +42,8 @@ export function jobFromRows(job: any, requiredCertifications: any[], shifts: any
       startTime: row.start_time,
       endTime: row.end_time,
     })),
+    employmentType: job.employment_type,
+    workplaceType: job.workplace_type,
+    status: job.status,
   };
 }

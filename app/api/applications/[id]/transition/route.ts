@@ -1,22 +1,15 @@
 import { NextResponse } from 'next/server';
-import { z } from 'zod';
 import { apiErrorResponse, readJson } from '@/lib/api';
 import { requireAuth } from '@/lib/auth';
 import { transitionApplicationForUser } from '@/lib/applicationService';
-
-const schema = z.object({ decision: z.enum(['accept', 'decline']), reason: z.string().trim().max(1000).nullable().optional() });
+import { applicationTransitionSchema } from '@/lib/validation';
 
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
   try {
     const auth = await requireAuth(request);
     const { id } = await context.params;
-    const input = schema.parse(await readJson(request));
-    const application = await transitionApplicationForUser({
-      applicationId: id,
-      to: input.decision === 'accept' ? 'worker_accepted' : 'worker_declined',
-      reason: input.reason,
-      auth,
-    });
+    const input = applicationTransitionSchema.parse(await readJson(request));
+    const application = await transitionApplicationForUser({ applicationId: id, to: input.to, reason: input.reason, auth });
     return NextResponse.json({ application });
   } catch (error) {
     return apiErrorResponse(error);

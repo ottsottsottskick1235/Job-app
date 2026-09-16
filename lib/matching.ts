@@ -1,7 +1,23 @@
-import type { JobForMatching, MatchResult, TimeBlock, WorkerForMatching } from './types';
+import type {
+  JobForMatching,
+  MatchResult,
+  MatchScoreBreakdown,
+  TimeBlock,
+  WorkerForMatching,
+} from './types';
+
+export const MATCHER_VERSION = '2.0.0';
 
 function normalize(value: string) {
   return value.trim().toLowerCase();
+}
+
+function clamp(value: number, min = 0, max = 1) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function roundScore(value: number) {
+  return Math.round(value * 100) / 100;
 }
 
 function toMinutes(time: string) {
@@ -11,6 +27,14 @@ function toMinutes(time: string) {
 
 function availabilityCovers(availability: TimeBlock[], shift: TimeBlock) {
   return availability.some((block) => {
+    if (block.weekday !== shift.weekday) return false;
+    return toMinutes(block.startTime) <= toMinutes(shift.startTime) &&
+      toMinutes(block.endTime) >= toMinutes(shift.endTime);
+  });
+}
+
+function coveringAvailability(availability: TimeBlock[], shift: TimeBlock) {
+  return availability.filter((block) => {
     if (block.weekday !== shift.weekday) return false;
     return toMinutes(block.startTime) <= toMinutes(shift.startTime) &&
       toMinutes(block.endTime) >= toMinutes(shift.endTime);
@@ -27,12 +51,105 @@ export function distanceKm(lat1: number, lon1: number, lat2: number, lon2: numbe
   return radius * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+function zeroBreakdown(): MatchScoreBreakdown {
+  return { distance: 0, pay: 0, experience: 0, hours: 0, schedule: 0, preferences: 0 };
+}
+
+function scoreEligibleMatch(worker: WorkerForMatching, job: JobForMatching, travelDistance: number): MatchScoreBreakdown {
+  const distanceWeight = 25;
+  const payWeight = 20;
+  const experienceWeight = 15;
+  const hoursWeight = 15;
+  const scheduleWeight = 10;
+  const preferencesWeight = 15;
+
+  const distanceRatio = job.workplaceType === 'remote'
+    ? 1
+    : 1 - clamp(travelDistance / Math.max(worker.maxTravelKm, 0.1));
+  const distance = distanceWeight * distanceRatio;
+
+  const paySurplus = Math.max(0, job.hourlyRate - worker.minHourlyRate);
+  const payScale = Math.max(worker.minHourlyRate * 0.5, 5);
+  const pay = payWeight * clamp(0.35 + (paySurplus / payScale) * 0.65);
+
+  const experienceSurplus = Math.max(0, worker.experienceMonths - job.minExperienceMonths);
+  const experienceScale = Math.max(job.minExperienceMonths, 12);
+  const experience = experienceWeight * clamp(0.5 + (experienceSurplus / experienceScale) * 0.5);
+
+  let hours = hoursWeight * 0.7;
+  if (job.weeklyHours != null && worker.minWeeklyHours != null && worker.maxWeeklyHours != null) {
+    const min = worker.minWeeklyHours;
+    const max = worker.maxWeeklyHours;
+    const midpoint = (min + max) / 2;
+    const halfRange = Math.max((max - min) / 2, 1);
+    hours = hoursWeight * clamp(1 - Math.abs(job.weeklyHours - midpoint) / (halfRange * 1.5));
+  } else if (job.weeklyHours != null && (worker.minWeeklyHours != null || worker.maxWeeklyHours != null)) {
+    hours = hoursWeight * 0.85;
+  }
+
+  let scheduleRatio = 1;
+  if (job.shifts.length) {
+    const ratios = job.shifts.map((shift) => {
+      const matches = coveringAvailability(worker.availability, shift);
+      if (!matches.length) return 0;
+      const shiftMinutes = Math.max(toMinutes(shift.endTime) - toMinutes(shift.startTime), 1);
+      const bestSlack = Math.max(...matches.map((block) => {
+        const before = toMinutes(shift.startTime) - toMinutes(block.startTime);
+        const after = toMinutes(block.endTime) - toMinutes(shift.endTime);
+        return before + after;
+      }));
+      return clamp(0.65 + (bestSlack / shiftMinutes) * 0.35);
+    });
+    scheduleRatio = ratios.reduce((sum, value) => sum + value, 0) / ratios.length;
+  }
+  const schedule = scheduleWeight * scheduleRatio;
+
+  let preferenceSignals = 1;
+  let preferenceHits = 1;
+  if (job.employmentType && worker.preferredEmploymentTypes?.length) {
+    preferenceSignals += 1;
+    if (worker.preferredEmploymentTypes.includes(job.employmentType)) preferenceHits += 1;
+  }
+  if (job.workplaceType && worker.preferredWorkplaceTypes?.length) {
+    preferenceSignals += 1;
+    if (worker.preferredWorkplaceTypes.includes(job.workplaceType)) preferenceHits += 1;
+  }
+  if (worker.roleKeywords?.length && job.title) {
+    preferenceSignals += 1;
+    const haystack = normalize(`${job.title} ${job.category}`);
+    if (worker.roleKeywords.some((keyword) => haystack.includes(normalize(keyword)))) preferenceHits += 1;
+  }
+  const preferences = preferencesWeight * (preferenceHits / preferenceSignals);
+
+  return {
+    distance: roundScore(distance),
+    pay: roundScore(pay),
+    experience: roundScore(experience),
+    hours: roundScore(hours),
+    schedule: roundScore(schedule),
+    preferences: roundScore(preferences),
+  };
+}
+
 export function evaluateMatch(worker: WorkerForMatching, job: JobForMatching): MatchResult {
   const reasons: string[] = [];
+
+  if (worker.active === false) reasons.push('Worker profile is inactive.');
+  if (job.status && job.status !== 'open') reasons.push(`Job status is ${job.status}, not open.`);
 
   const workerRoles = worker.preferredRoles.map(normalize);
   if (!workerRoles.includes(normalize(job.category))) {
     reasons.push(`Job category "${job.category}" is not in the worker's preferred roles.`);
+  }
+
+  if (job.employmentType && worker.preferredEmploymentTypes?.length &&
+      !worker.preferredEmploymentTypes.includes(job.employmentType)) {
+    reasons.push(`Job employment type "${job.employmentType}" is not in the worker's preferences.`);
+  }
+
+  if (job.workplaceType && worker.preferredWorkplaceTypes?.length &&
+      !worker.preferredWorkplaceTypes.includes(job.workplaceType)) {
+    reasons.push(`Job workplace type "${job.workplaceType}" is not in the worker's preferences.`);
   }
 
   if (job.hourlyRate < worker.minHourlyRate) {
@@ -44,7 +161,7 @@ export function evaluateMatch(worker: WorkerForMatching, job: JobForMatching): M
   }
 
   const travelDistance = distanceKm(worker.latitude, worker.longitude, job.latitude, job.longitude);
-  if (travelDistance > worker.maxTravelKm) {
+  if (job.workplaceType !== 'remote' && travelDistance > worker.maxTravelKm) {
     reasons.push(`Job is ${travelDistance.toFixed(1)} km away; worker maximum is ${worker.maxTravelKm} km.`);
   }
 
@@ -67,9 +184,7 @@ export function evaluateMatch(worker: WorkerForMatching, job: JobForMatching): M
     if (cert.expiresOn && job.startDate) {
       const expiry = new Date(`${cert.expiresOn}T23:59:59Z`).getTime();
       const start = new Date(`${job.startDate}T00:00:00Z`).getTime();
-      if (expiry < start) {
-        reasons.push(`${required} expires before the job start date.`);
-      }
+      if (expiry < start) reasons.push(`${required} expires before the job start date.`);
     }
   }
 
@@ -79,5 +194,17 @@ export function evaluateMatch(worker: WorkerForMatching, job: JobForMatching): M
     }
   }
 
-  return { eligible: reasons.length === 0, reasons };
+  if (reasons.length) {
+    return {
+      eligible: false,
+      reasons,
+      score: 0,
+      scoreBreakdown: zeroBreakdown(),
+      matcherVersion: MATCHER_VERSION,
+    };
+  }
+
+  const scoreBreakdown = scoreEligibleMatch(worker, job, travelDistance);
+  const score = roundScore(Object.values(scoreBreakdown).reduce((sum, value) => sum + value, 0));
+  return { eligible: true, reasons: [], score, scoreBreakdown, matcherVersion: MATCHER_VERSION };
 }
